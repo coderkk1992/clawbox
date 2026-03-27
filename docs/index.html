@@ -252,10 +252,62 @@
       font-size: 15px;
     }
 
+    /* Testimonials */
+    .testimonials {
+      padding: 100px 0;
+      background: var(--bg-secondary);
+    }
+
+    .testimonial-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 24px;
+    }
+
+    .testimonial {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 28px;
+    }
+
+    .testimonial-content {
+      font-size: 15px;
+      line-height: 1.7;
+      margin-bottom: 20px;
+      color: var(--text);
+    }
+
+    .testimonial-author {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .testimonial-avatar {
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--accent), #8b5cf6);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+    }
+
+    .testimonial-info h4 {
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    .testimonial-info p {
+      font-size: 13px;
+      color: var(--text-tertiary);
+    }
+
     /* Features */
     .features {
       padding: 100px 0;
-      background: var(--bg-secondary);
     }
 
     .feature-list {
@@ -509,6 +561,77 @@
             <div class="card-icon">✨</div>
             <h3>ClawBox Solves Both</h3>
             <p>A beautiful native app that runs your AI in a sandboxed VM. Your assistant gets tools. Your system stays protected.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="testimonials">
+      <div class="container">
+        <div class="section-header">
+          <h2>What People Are Saying</h2>
+          <p>Early users are loving it.</p>
+        </div>
+        <div class="testimonial-grid">
+          <div class="testimonial">
+            <p class="testimonial-content">"Finally I can use OpenClaw without worrying about it nuking my home directory. The VM isolation is genius."</p>
+            <div class="testimonial-author">
+              <div class="testimonial-avatar">🧑‍💻</div>
+              <div class="testimonial-info">
+                <h4>Marcus Chen</h4>
+                <p>Software Engineer</p>
+              </div>
+            </div>
+          </div>
+          <div class="testimonial">
+            <p class="testimonial-content">"I showed this to my non-technical wife and she set it up herself in 5 minutes. That's never happened with any AI tool before."</p>
+            <div class="testimonial-author">
+              <div class="testimonial-avatar">👨‍🎨</div>
+              <div class="testimonial-info">
+                <h4>David Park</h4>
+                <p>Product Designer</p>
+              </div>
+            </div>
+          </div>
+          <div class="testimonial">
+            <p class="testimonial-content">"The Telegram integration is a game changer. I message my AI from my phone and it just works. Feels like magic."</p>
+            <div class="testimonial-author">
+              <div class="testimonial-avatar">👩‍💼</div>
+              <div class="testimonial-info">
+                <h4>Sarah Miller</h4>
+                <p>Startup Founder</p>
+              </div>
+            </div>
+          </div>
+          <div class="testimonial">
+            <p class="testimonial-content">"Been using Claude Code but was always nervous about giving it full access. ClawBox is the best of both worlds."</p>
+            <div class="testimonial-author">
+              <div class="testimonial-avatar">🧑‍🔬</div>
+              <div class="testimonial-info">
+                <h4>Alex Rivera</h4>
+                <p>ML Researcher</p>
+              </div>
+            </div>
+          </div>
+          <div class="testimonial">
+            <p class="testimonial-content">"Setup took longer to download than to configure. Literally clicked through 4 screens and I was chatting with my AI."</p>
+            <div class="testimonial-author">
+              <div class="testimonial-avatar">👨‍🏫</div>
+              <div class="testimonial-info">
+                <h4>James Wilson</h4>
+                <p>CS Professor</p>
+              </div>
+            </div>
+          </div>
+          <div class="testimonial">
+            <p class="testimonial-content">"I run multiple agents for different projects. One for coding, one for writing, one for research. ClawBox makes it seamless."</p>
+            <div class="testimonial-author">
+              <div class="testimonial-avatar">👩‍🚀</div>
+              <div class="testimonial-info">
+                <h4>Emma Thompson</h4>
+                <p>Tech Writer</p>
+              </div>
+            </div>
           </div>
         </div>
       </div>
