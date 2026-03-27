@@ -81,8 +81,8 @@ Grab the latest release for your Mac:
 
 | Chip | Download |
 |------|----------|
-| Apple Silicon (M1/M2/M3/M4) | [ClawBox_aarch64.dmg](https://github.com/AiClawBox/ClawBox/releases/latest) |
-| Intel | [ClawBox_x64.dmg](https://github.com/AiClawBox/ClawBox/releases/latest) |
+| Apple Silicon (M1/M2/M3/M4) | [ClawBox_0.1.0_aarch64.dmg](releases/ClawBox_0.1.0_aarch64.dmg?raw=true) |
+| Intel | [ClawBox_0.1.0_x64.dmg](releases/ClawBox_0.1.0_x64.dmg?raw=true) |
 
 ### Requirements
 
