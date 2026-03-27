@@ -23,6 +23,7 @@ export interface SetupConfig {
   cpus: number;
   anthropic_api_key?: string;
   openai_api_key?: string;
+  model?: string;
 }
 
 export interface SetupProgressEvent {

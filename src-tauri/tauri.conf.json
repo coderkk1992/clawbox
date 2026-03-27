@@ -12,10 +12,10 @@
   "app": {
     "windows": [
       {
-        "title": "ClawBox",
-        "width": 500,
+        "title": "",
+        "width": 680,
         "height": 860,
-        "minWidth": 460,
+        "minWidth": 520,
         "minHeight": 720,
         "center": true,
         "resizable": true,
@@ -23,10 +23,6 @@
         "transparent": false
       }
     ],
-    "trayIcon": {
-      "iconPath": "icons/icon.png",
-      "iconAsTemplate": true
-    },
     "security": {
       "csp": "default-src 'self'; connect-src 'self' http://localhost:* ws://localhost:*; frame-src http://localhost:*"
     }
@@ -42,7 +38,8 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "minimumSystemVersion": "11.0"
+      "minimumSystemVersion": "13.0",
+      "signingIdentity": "Developer ID Application: Kalith Kumasaru (GE748JN8C8)"
     }
   }
 }

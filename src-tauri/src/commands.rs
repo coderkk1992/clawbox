@@ -1,3 +1,4 @@
+use crate::agents::{AgentsManager, CreateAgentConfig, UpdateAgentConfig, Agent};
 use crate::setup::SetupManager;
 use crate::vm::{lima::LimaManager, VmConfig, VmManager, VmStatus};
 use crate::ws_proxy::{self, WsProxy};
@@ -11,6 +12,7 @@ pub struct AppState {
     pub setup_manager: Arc<Mutex<SetupManager>>,
     pub config: Arc<Mutex<VmConfig>>,
     pub ws_proxy: Arc<Mutex<WsProxy>>,
+    pub agents_manager: Arc<AgentsManager>,
 }
 
 impl Default for AppState {
@@ -20,6 +22,7 @@ impl Default for AppState {
             setup_manager: Arc::new(Mutex::new(SetupManager::new())),
             config: Arc::new(Mutex::new(VmConfig::default())),
             ws_proxy: Arc::new(Mutex::new(WsProxy::new())),
+            agents_manager: Arc::new(AgentsManager::new()),
         }
     }
 }
@@ -30,6 +33,7 @@ pub struct SetupConfig {
     pub cpus: u32,
     pub anthropic_api_key: Option<String>,
     pub openai_api_key: Option<String>,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,13 +66,11 @@ pub fn get_system_info(_state: State<'_, AppState>) -> Result<SystemInfo, String
         .map(|p| p.get())
         .unwrap_or(4);
 
-    // Check if Lima config exists (quick file check, no subprocess)
+    // Check if setup completed successfully (marker file created at end of setup)
     let config_dir = dirs::home_dir()
         .unwrap_or_default()
         .join(".clawbox");
-    let lima_yaml_exists = config_dir.join("lima.yaml").exists();
-
-    let setup_complete = lima_yaml_exists;
+    let setup_complete = config_dir.join(".setup_complete").exists();
 
     Ok(SystemInfo {
         total_ram_mb,
@@ -147,8 +149,8 @@ pub async fn run_full_setup(
         }
     }
 
-    // Step 2: Create VM
-    emit_progress("vm", 35, "Creating Linux virtual machine...");
+    // Step 2: Create or reuse VM
+    emit_progress("vm", 35, "Setting up virtual machine...");
 
     {
         let vm = state.vm_manager.lock().await;
@@ -157,62 +159,180 @@ pub async fn run_full_setup(
         app_config.ram_mb = config.ram_mb;
         app_config.cpus = config.cpus;
 
-        emit_progress("vm", 40, "Setting up Ubuntu environment...");
-        vm.create(&app_config).map_err(|e| {
-            emit_progress("error", 0, &e.to_string());
-            e.to_string()
-        })?;
+        // Check current VM status
+        let vm_status = vm.status().unwrap_or(crate::vm::VmStatus::NotCreated);
+
+        match vm_status {
+            crate::vm::VmStatus::Running => {
+                // VM already running, just continue
+                emit_progress("vm", 60, "Virtual machine already running...");
+            }
+            crate::vm::VmStatus::Stopped => {
+                // VM exists but stopped, start it
+                emit_progress("vm", 50, "Starting existing virtual machine...");
+                drop(app_config);
+                vm.start().map_err(|e| {
+                    emit_progress("error", 0, &e.to_string());
+                    e.to_string()
+                })?;
+                emit_progress("vm", 60, "Virtual machine started...");
+            }
+            crate::vm::VmStatus::NotCreated => {
+                // No VM exists, create it
+                emit_progress("vm", 40, "Creating Linux virtual machine...");
+                vm.create(&app_config).map_err(|e| {
+                    emit_progress("error", 0, &e.to_string());
+                    e.to_string()
+                })?;
+                emit_progress("vm", 55, "Starting virtual machine...");
+                drop(app_config);
+                vm.start().map_err(|e| {
+                    emit_progress("error", 0, &e.to_string());
+                    e.to_string()
+                })?;
+                emit_progress("vm", 60, "Virtual machine started...");
+            }
+            _ => {
+                // Starting, stopping, or error state - wait and retry
+                emit_progress("vm", 40, "Waiting for virtual machine...");
+                drop(app_config);
+                drop(vm);
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                let vm = state.vm_manager.lock().await;
+                vm.start().map_err(|e| {
+                    emit_progress("error", 0, &e.to_string());
+                    e.to_string()
+                })?;
+                emit_progress("vm", 60, "Virtual machine started...");
+            }
+        }
     }
 
-    emit_progress("vm", 60, "Starting virtual machine...");
+    emit_progress("openclaw", 70, "Configuring OpenClaw...");
 
-    // Step 3: Start VM
+    // Update systemd service to ensure it loads the .env file (for existing VMs)
     {
         let vm = state.vm_manager.lock().await;
-        vm.start().map_err(|e| {
-            emit_progress("error", 0, &e.to_string());
-            e.to_string()
-        })?;
+
+        let service_content = r#"[Unit]
+Description=OpenClaw Gateway
+After=network.target
+
+[Service]
+Type=simple
+User=openclaw
+WorkingDirectory=/home/openclaw
+Environment=HOME=/home/openclaw
+Environment=OPENCLAW_STATE_DIR=/home/openclaw/.openclaw
+EnvironmentFile=-/home/openclaw/.openclaw/.env
+ExecStart=/usr/bin/openclaw gateway --bind lan --port 18789
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"#;
+
+        let cmd = format!(
+            "cat << 'EOFSVC' | sudo tee /etc/systemd/system/openclaw.service > /dev/null\n{}EOFSVC",
+            service_content
+        );
+        let _ = vm.exec(&cmd);
+        let _ = vm.exec("sudo systemctl daemon-reload");
     }
 
-    emit_progress("openclaw", 70, "Installing OpenClaw...");
-
-    // Step 4: Configure API keys
+    // Step 4: Configure API keys - always set them fresh (overwrite, not append)
     emit_progress("config", 85, "Configuring API keys...");
 
     {
         let vm = state.vm_manager.lock().await;
 
+        // Create the directory first
+        vm.exec("sudo mkdir -p /home/openclaw/.openclaw").map_err(|e| {
+            emit_progress("error", 0, &format!("Failed to create config directory: {}", e));
+            e.to_string()
+        })?;
+
+        // Build the .env content
+        let mut env_content = String::new();
+
         if let Some(key) = &config.anthropic_api_key {
-            let cmd = format!(
-                "sudo mkdir -p /home/openclaw/.openclaw && echo 'ANTHROPIC_API_KEY={}' | sudo tee -a /home/openclaw/.openclaw/.env > /dev/null",
-                key
-            );
-            let _ = vm.exec(&cmd);
+            env_content.push_str(&format!("ANTHROPIC_API_KEY={}\n", key));
         }
 
         if let Some(key) = &config.openai_api_key {
+            env_content.push_str(&format!("OPENAI_API_KEY={}\n", key));
+        }
+
+        // Write the .env file (overwrite, not append)
+        if !env_content.is_empty() {
             let cmd = format!(
-                "echo 'OPENAI_API_KEY={}' | sudo tee -a /home/openclaw/.openclaw/.env > /dev/null",
-                key
+                "cat << 'EOFENV' | sudo tee /home/openclaw/.openclaw/.env > /dev/null\n{}EOFENV",
+                env_content
             );
-            let _ = vm.exec(&cmd);
+            vm.exec(&cmd).map_err(|e| {
+                emit_progress("error", 0, &format!("Failed to write API keys: {}", e));
+                e.to_string()
+            })?;
         }
 
         // Fix ownership
-        let _ = vm.exec("sudo chown -R openclaw:openclaw /home/openclaw/.openclaw");
+        vm.exec("sudo chown -R openclaw:openclaw /home/openclaw/.openclaw").map_err(|e| {
+            emit_progress("error", 0, &format!("Failed to set permissions: {}", e));
+            e.to_string()
+        })?;
+
+        // Set the model if specified (for free/local models)
+        if let Some(model) = &config.model {
+            let cmd = format!(
+                "sudo -u openclaw OPENCLAW_STATE_DIR=/home/openclaw/.openclaw openclaw models set '{}' --non-interactive 2>&1 || true",
+                model
+            );
+            let _ = vm.exec(&cmd);
+        }
     }
 
     emit_progress("gateway", 90, "Starting OpenClaw gateway...");
 
-    // Step 5: Restart OpenClaw service
+    // Step 5: Restart OpenClaw service to pick up new API keys
     {
         let vm = state.vm_manager.lock().await;
-        let _ = vm.exec("sudo systemctl restart openclaw");
+
+        // Stop the service first (ignore errors if not running)
+        let _ = vm.exec("sudo systemctl stop openclaw");
+
+        // Make sure the service file has the right environment
+        let _ = vm.exec("sudo systemctl daemon-reload");
+
+        // Start the service
+        vm.exec("sudo systemctl start openclaw").map_err(|e| {
+            emit_progress("error", 0, &format!("Failed to start OpenClaw: {}", e));
+            e.to_string()
+        })?;
     }
 
-    // Give it a moment to start
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    // Give the service time to fully start
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+    // Verify the service is running
+    {
+        let vm = state.vm_manager.lock().await;
+        let status = vm.exec("sudo systemctl is-active openclaw");
+        if let Ok(output) = status {
+            if !output.trim().contains("active") {
+                emit_progress("error", 0, "OpenClaw service failed to start");
+                return Err("OpenClaw service failed to start".to_string());
+            }
+        }
+    }
+
+    // Create marker file to indicate setup completed successfully
+    let config_dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".clawbox");
+    std::fs::write(config_dir.join(".setup_complete"), "").map_err(|e| {
+        format!("Failed to write setup marker: {}", e)
+    })?;
 
     emit_progress("complete", 100, "Setup complete!");
 
@@ -242,6 +362,72 @@ pub async fn restart_vm(state: State<'_, AppState>) -> Result<(), String> {
 pub async fn delete_vm(state: State<'_, AppState>) -> Result<(), String> {
     let vm = state.vm_manager.lock().await;
     vm.delete().map_err(|e| e.to_string())
+}
+
+/// Full cleanup - delete VM, Lima, and all ClawBox data
+#[tauri::command]
+pub async fn full_cleanup(state: State<'_, AppState>) -> Result<(), String> {
+    let vm = state.vm_manager.lock().await;
+
+    // Try to delete the VM (ignore errors if it doesn't exist)
+    let _ = vm.delete();
+
+    // Get the config directory path
+    let config_dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".clawbox");
+
+    // Delete the Lima installation and config
+    if config_dir.exists() {
+        std::fs::remove_dir_all(&config_dir).map_err(|e| {
+            format!("Failed to remove ClawBox data: {}", e)
+        })?;
+    }
+
+    // Also clean up Lima's instance data for clawbox
+    let lima_dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".lima")
+        .join("clawbox");
+
+    if lima_dir.exists() {
+        std::fs::remove_dir_all(&lima_dir).map_err(|e| {
+            format!("Failed to remove Lima VM data: {}", e)
+        })?;
+    }
+
+    Ok(())
+}
+
+/// Check if there's an orphaned VM (VM exists but setup not complete)
+#[tauri::command]
+pub async fn check_orphaned_vm(state: State<'_, AppState>) -> Result<bool, String> {
+    let config_dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".clawbox");
+
+    // If setup_complete marker exists, no orphan
+    if config_dir.join(".setup_complete").exists() {
+        return Ok(false);
+    }
+
+    // Check if VM or Lima data exists without setup_complete marker (orphaned state)
+    let vm = state.vm_manager.lock().await;
+    let vm_status = vm.status().unwrap_or(crate::vm::VmStatus::NotCreated);
+
+    // If VM exists but setup didn't complete, it's orphaned
+    match vm_status {
+        crate::vm::VmStatus::Running | crate::vm::VmStatus::Stopped => Ok(true),
+        _ => {
+            // Also check if Lima directory or lima.yaml exists
+            let lima_dir = dirs::home_dir()
+                .unwrap_or_default()
+                .join(".lima")
+                .join("clawbox");
+            let lima_yaml = config_dir.join("lima.yaml").exists();
+            Ok(lima_dir.exists() || lima_yaml)
+        }
+    }
 }
 
 #[tauri::command]
@@ -546,9 +732,9 @@ pub async fn send_chat_message(
         .replace("\"", "\\\"");
 
     // Use openclaw agent command to send a message
-    // --agent main targets the main agent's session
+    // Source the .env file to get API keys, then run the agent command
     let cmd = format!(
-        r#"sudo -u openclaw bash -c 'cd /home/openclaw && OPENCLAW_STATE_DIR=/home/openclaw/.openclaw openclaw agent --agent main --message "{}" 2>&1'"#,
+        r#"sudo -u openclaw bash -c 'cd /home/openclaw && set -a && source /home/openclaw/.openclaw/.env 2>/dev/null; set +a && OPENCLAW_STATE_DIR=/home/openclaw/.openclaw openclaw agent --agent main --message "{}" 2>&1'"#,
         escaped_message
     );
 
@@ -750,8 +936,8 @@ pub async fn upload_file(
 
     let vm = state.vm_manager.lock().await;
 
-    // Create uploads directory in VM
-    vm.exec("sudo -u openclaw mkdir -p /home/openclaw/.openclaw/workspace/uploads")
+    // Create files directory in VM (shared location for user files)
+    vm.exec("sudo -u openclaw mkdir -p /home/openclaw/.openclaw/workspace/files")
         .map_err(|e| e.to_string())?;
 
     // Sanitize the filename
@@ -793,7 +979,7 @@ pub async fn upload_file(
     // Use limactl copy to transfer the file to the VM
     // First copy to /tmp in VM, then move to final location with correct ownership
     let vm_temp_path = format!("/tmp/upload_{}", timestamp);
-    let vm_final_path = format!("/home/openclaw/.openclaw/workspace/uploads/{}", final_name);
+    let vm_final_path = format!("/home/openclaw/.openclaw/workspace/files/{}", final_name);
 
     // Get limactl path from the VM manager
     let config_dir = dirs::home_dir()
@@ -832,9 +1018,135 @@ pub async fn upload_file(
     vm.exec(&move_cmd).map_err(|e| e.to_string())?;
 
     Ok(UploadResult {
-        path: format!("/workspace/uploads/{}", final_name),
+        path: format!("/workspace/files/{}", final_name),
         name: final_name,
     })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceFile {
+    pub name: String,
+    pub path: String,
+    pub size: u64,
+    pub is_dir: bool,
+}
+
+/// List files in the VM workspace
+#[tauri::command]
+pub async fn list_workspace_files(
+    path: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<WorkspaceFile>, String> {
+    let vm = state.vm_manager.lock().await;
+
+    // Use the main workspace directory
+    let workspace_path = path.unwrap_or_else(|| "/home/openclaw/.openclaw/workspace".to_string());
+
+    // List files with size info
+    let cmd = format!(
+        "sudo find {} -maxdepth 1 -printf '%T@ %s %y %p\\n' 2>/dev/null | sort -rn | tail -n +2",
+        workspace_path
+    );
+
+    match vm.exec(&cmd) {
+        Ok(output) => {
+            let files: Vec<WorkspaceFile> = output
+                .lines()
+                .filter_map(|line| {
+                    let parts: Vec<&str> = line.splitn(4, ' ').collect();
+                    if parts.len() >= 4 {
+                        let size: u64 = parts[1].parse().unwrap_or(0);
+                        let is_dir = parts[2] == "d";
+                        let full_path = parts[3];
+                        let name = full_path.rsplit('/').next().unwrap_or(full_path);
+                        Some(WorkspaceFile {
+                            name: name.to_string(),
+                            path: full_path.to_string(),
+                            size,
+                            is_dir,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            Ok(files)
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Download a file from the VM workspace (returns base64 content)
+#[tauri::command]
+pub async fn download_file(
+    vm_path: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let vm = state.vm_manager.lock().await;
+
+    // Read file content and base64 encode it
+    let cmd = format!("sudo cat '{}' | base64", vm_path);
+
+    match vm.exec(&cmd) {
+        Ok(output) => {
+            // Return the base64 content
+            Ok(output.trim().to_string())
+        }
+        Err(e) => Err(format!("Failed to read file: {}", e)),
+    }
+}
+
+/// Download a file from the VM workspace and save to Downloads folder
+#[tauri::command]
+pub async fn download_and_save_file(
+    vm_path: String,
+    filename: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use base64::Engine;
+    use std::io::Write;
+
+    let vm = state.vm_manager.lock().await;
+
+    // Get Downloads folder
+    let downloads_dir = dirs::download_dir()
+        .ok_or("Could not find Downloads folder")?;
+
+    // Create unique filename if file exists
+    let mut final_path = downloads_dir.join(&filename);
+    let mut counter = 1;
+    while final_path.exists() {
+        let name_without_ext = filename.rsplit_once('.')
+            .map(|(n, _)| n)
+            .unwrap_or(&filename);
+        let ext = filename.rsplit_once('.')
+            .map(|(_, e)| format!(".{}", e))
+            .unwrap_or_default();
+        final_path = downloads_dir.join(format!("{} ({}){}", name_without_ext, counter, ext));
+        counter += 1;
+    }
+
+    // Read file content from VM (base64 encoded, using -w0 to avoid line wrapping)
+    let cmd = format!("sudo cat '{}' | base64 -w0", vm_path);
+    let base64_content = vm.exec(&cmd)
+        .map_err(|e| format!("Failed to read file from VM: {}", e))?;
+
+    // Remove any whitespace/newlines from base64 content
+    let clean_base64: String = base64_content.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // Decode base64
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&clean_base64)
+        .map_err(|e| format!("Failed to decode file content: {}", e))?;
+
+    // Write to Downloads folder
+    let mut file = std::fs::File::create(&final_path)
+        .map_err(|e| format!("Failed to create file: {}", e))?;
+    file.write_all(&decoded)
+        .map_err(|e| format!("Failed to write file: {}", e))?;
+
+    // Return the path as string
+    Ok(final_path.to_string_lossy().to_string())
 }
 
 /// Get list of configured channels
@@ -873,4 +1185,95 @@ pub async fn get_channels(state: State<'_, AppState>) -> Result<Vec<String>, Str
         }
         Err(_) => Ok(vec![]),
     }
+}
+
+// ============ Agent Management Commands ============
+
+/// Create a new agent
+#[tauri::command]
+pub async fn create_agent(
+    config: CreateAgentConfig,
+    state: State<'_, AppState>,
+) -> Result<Agent, String> {
+    state.agents_manager.create_agent(config)
+}
+
+/// List all agents
+#[tauri::command]
+pub async fn list_agents(state: State<'_, AppState>) -> Result<Vec<Agent>, String> {
+    Ok(state.agents_manager.list_agents())
+}
+
+/// Get a specific agent by ID
+#[tauri::command]
+pub async fn get_agent(id: String, state: State<'_, AppState>) -> Result<Agent, String> {
+    state.agents_manager.get_agent(&id)
+        .ok_or_else(|| format!("Agent not found: {}", id))
+}
+
+/// Get the currently active agent
+#[tauri::command]
+pub async fn get_active_agent(state: State<'_, AppState>) -> Result<Option<Agent>, String> {
+    Ok(state.agents_manager.get_active_agent())
+}
+
+/// Update an existing agent
+#[tauri::command]
+pub async fn update_agent(
+    id: String,
+    config: UpdateAgentConfig,
+    state: State<'_, AppState>,
+) -> Result<Agent, String> {
+    state.agents_manager.update_agent(&id, config)
+}
+
+/// Delete an agent
+#[tauri::command]
+pub async fn delete_agent_by_id(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.agents_manager.delete_agent(&id)
+}
+
+/// Switch to a different agent
+#[tauri::command]
+pub async fn switch_agent(id: String, state: State<'_, AppState>) -> Result<Agent, String> {
+    let agent = state.agents_manager.switch_agent(&id)?;
+
+    // Reconfigure OpenClaw with the new agent's persona
+    let vm = state.vm_manager.lock().await;
+
+    // Generate new SOUL.md for this agent
+    let config = AgentConfig {
+        persona: agent.persona.clone(),
+        name: agent.name.clone(),
+        preferences: agent.preferences.clone(),
+        capabilities: agent.capabilities.clone(),
+        telegram_bot_token: None,
+        telegram_bot_username: None,
+    };
+
+    let soul_content = generate_soul_md(&config);
+    let cmd = format!(
+        "sudo mkdir -p /home/openclaw/.openclaw/workspace && sudo tee /home/openclaw/.openclaw/workspace/SOUL.md > /dev/null << 'EOFSOULMID'\n{}\nEOFSOULMID",
+        soul_content
+    );
+    let _ = vm.exec(&cmd);
+
+    // Generate new IDENTITY.md
+    let identity_content = generate_identity_md(&config);
+    let cmd = format!(
+        "sudo tee /home/openclaw/.openclaw/workspace/IDENTITY.md > /dev/null << 'EOFIDENTITYMID'\n{}\nEOFIDENTITYMID",
+        identity_content
+    );
+    let _ = vm.exec(&cmd);
+
+    // Clear the session files so the new agent starts fresh
+    let _ = vm.exec("sudo rm -rf /home/openclaw/.openclaw/agents/main/sessions/*");
+
+    // Fix ownership
+    let _ = vm.exec("sudo chown -R openclaw:openclaw /home/openclaw/.openclaw");
+
+    // Restart OpenClaw to pick up new config
+    let _ = vm.exec("sudo systemctl restart openclaw");
+
+    Ok(agent)
 }

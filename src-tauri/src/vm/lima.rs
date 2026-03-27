@@ -112,6 +112,7 @@ provision:
       WorkingDirectory=/home/openclaw
       Environment=HOME=/home/openclaw
       Environment=OPENCLAW_STATE_DIR=/home/openclaw/.openclaw
+      EnvironmentFile=-/home/openclaw/.openclaw/.env
       ExecStart=/usr/bin/openclaw gateway --bind lan --port {port}
       Restart=always
       RestartSec=5

@@ -1,8 +1,17 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import { openPath, revealItemInDir } from '@tauri-apps/plugin-opener';
 import ReactMarkdown from 'react-markdown';
 import type { StatusResponse } from '../types';
+import { getPixelCharacter } from '../components/PixelCharacters';
+import { initNotifications, parseReminderFromResponse, scheduleReminder } from '../utils/notifications';
+
+interface MessageAttachment {
+  name: string;
+  preview?: string;
+  type: 'image' | 'file';
+}
 
 interface Message {
   id: string;
@@ -11,6 +20,7 @@ interface Message {
   timestamp: Date;
   pending?: boolean;
   channel?: string;
+  attachments?: MessageAttachment[];
 }
 
 interface AttachedFile {
@@ -24,6 +34,7 @@ interface Props {
   status: StatusResponse;
   onBack: () => void;
   onOpenSettings?: () => void;
+  activeAgentId?: string | null;
 }
 
 type ConnectionState = 'connecting' | 'authenticating' | 'connected' | 'disconnected' | 'error';
@@ -55,14 +66,13 @@ const CHANNELS: ChannelInfo[] = [
   { id: 'tlon', name: 'Tlon', instructions: 'Tlon/Urbit integration will be configured' },
 ];
 
-export function Chat({ status, onBack, onOpenSettings: _onOpenSettings }: Props) {
+export function Chat({ status, onBack: _onBack, onOpenSettings: _onOpenSettings, activeAgentId }: Props) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [_connectionState, setConnectionState] = useState<ConnectionState>('disconnected');
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [_debugInfo, setDebugInfo] = useState('initializing...');
-  const [showChannelSetup, setShowChannelSetup] = useState(false);
   const [historyLoaded, setHistoryLoaded] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [selectedChannel, setSelectedChannel] = useState<ChannelInfo | null>(null);
@@ -73,9 +83,15 @@ export function Chat({ status, onBack, onOpenSettings: _onOpenSettings }: Props)
   const [channelSuccess, setChannelSuccess] = useState<string | null>(null);
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  const [currentAgentId, setCurrentAgentId] = useState<string | null>(activeAgentId || null);
+  const [workspaceFiles, setWorkspaceFiles] = useState<{ name: string; path: string; size: number; is_dir: boolean }[]>([]);
+  const [showFilesPanel, setShowFilesPanel] = useState(false);
+  const [downloadingFile, setDownloadingFile] = useState<string | null>(null);
+  const [downloadedFile, setDownloadedFile] = useState<{ name: string; path: string } | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const messageIdRef = useRef(0);
   const gatewayTokenRef = useRef<string | null>(null);
   const unlistenersRef = useRef<UnlistenFn[]>([]);
@@ -197,6 +213,129 @@ export function Chat({ status, onBack, onOpenSettings: _onOpenSettings }: Props)
     setAttachedFiles(prev => prev.filter((_, i) => i !== index));
   };
 
+  // Handle file input change (from button click)
+  const handleFileInputChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files) return;
+
+    for (const file of Array.from(files)) {
+      const uploaded = await uploadFile(file);
+      if (uploaded) {
+        setAttachedFiles(prev => [...prev, uploaded]);
+      }
+    }
+
+    // Reset input so same file can be selected again
+    e.target.value = '';
+  };
+
+  // Open file picker
+  const openFilePicker = () => {
+    fileInputRef.current?.click();
+  };
+
+  // Fetch workspace files
+  const fetchWorkspaceFiles = useCallback(async () => {
+    try {
+      const files = await invoke('list_workspace_files', { path: null }) as { name: string; path: string; size: number; is_dir: boolean }[];
+      // Filter out directories, hidden files, and system files
+      const systemFiles = ['AGENTS.md', 'HEARTBEAT.md', 'IDENTITY.md', 'SOUL.md', 'TOOLS.md', 'USER.md', 'package.json', 'package-lock.json'];
+      // User file extensions we want to show
+      const userExtensions = ['.docx', '.doc', '.pdf', '.txt', '.csv', '.xlsx', '.xls', '.pptx', '.ppt', '.png', '.jpg', '.jpeg', '.gif', '.zip', '.mp3', '.mp4'];
+      setWorkspaceFiles(files.filter(f => {
+        if (f.is_dir) return false;
+        if (f.name.startsWith('.')) return false;
+        if (systemFiles.includes(f.name)) return false;
+        // Show files with user-friendly extensions
+        return userExtensions.some(ext => f.name.toLowerCase().endsWith(ext));
+      }));
+    } catch (e) {
+      console.error('Failed to fetch workspace files:', e);
+    }
+  }, []);
+
+  // Download file from workspace and save to Downloads folder
+  const downloadWorkspaceFile = useCallback(async (file: { name: string; path: string }) => {
+    console.log('downloadWorkspaceFile called with:', file);
+    // Show downloading indicator
+    setDownloadingFile(file.name);
+    setDownloadedFile(null);
+
+    try {
+      console.log('Invoking download_and_save_file...');
+      // Download and save to Downloads folder, returns the local path
+      const savedPath = await invoke('download_and_save_file', {
+        vmPath: file.path,
+        filename: file.name,
+      }) as string;
+      console.log('Download successful, savedPath:', savedPath);
+
+      // Show success toast with open option
+      console.log('Setting downloadingFile to null and downloadedFile to:', { name: file.name, path: savedPath });
+      setDownloadingFile(null);
+      setDownloadedFile({ name: file.name, path: savedPath });
+      console.log('State updates called');
+
+      // Auto-hide toast after 8 seconds
+      setTimeout(() => {
+        console.log('Auto-hide timeout triggered');
+        setDownloadedFile(prev => {
+          if (prev?.path === savedPath) {
+            return null;
+          }
+          return prev;
+        });
+      }, 8000);
+    } catch (e) {
+      console.error('Failed to download file:', e);
+      setError('Failed to download file: ' + e);
+      setDownloadingFile(null);
+    }
+  }, []);
+
+  // Download file by VM path
+  const downloadFileByPath = useCallback(async (vmPath: string) => {
+    console.log('downloadFileByPath called with:', vmPath);
+    const filename = vmPath.split('/').pop() || 'file';
+    await downloadWorkspaceFile({ name: filename, path: vmPath });
+  }, [downloadWorkspaceFile]);
+
+
+  // Open downloaded file using system default app
+  const openDownloadedFile = async () => {
+    if (downloadedFile?.path) {
+      try {
+        await openPath(downloadedFile.path);
+      } catch (e) {
+        console.error('Failed to open file:', e);
+        setError('Failed to open file: ' + e);
+      }
+    }
+  };
+
+  // Show in Finder
+  const showInFinder = async () => {
+    if (downloadedFile?.path) {
+      try {
+        await revealItemInDir(downloadedFile.path);
+      } catch (e) {
+        console.error('Failed to show in Finder:', e);
+      }
+    }
+  };
+
+  // Dismiss download toast
+  const dismissDownloadToast = () => {
+    setDownloadedFile(null);
+  };
+
+  // Extract filenames from message content
+  const extractFilesFromMessage = (content: string): string[] => {
+    const fileExtensions = /\b([A-Za-z0-9_-]+\.(docx?|xlsx?|pptx?|pdf|txt|csv|zip|png|jpg|jpeg|gif|mp3|mp4))\b/gi;
+    const matches = content.match(fileExtensions);
+    return matches ? [...new Set(matches)] : [];
+  };
+
   // Fetch configured channels
   const fetchConfiguredChannels = useCallback(async () => {
     try {
@@ -282,11 +421,6 @@ export function Chat({ status, onBack, onOpenSettings: _onOpenSettings }: Props)
       } else {
         setDebugInfo('no history found');
         setHistoryLoaded(true);
-        // Show channel setup for first-time users with no history
-        const channelSetupDismissed = localStorage.getItem('clawbox_channel_setup_dismissed');
-        if (!channelSetupDismissed) {
-          setShowChannelSetup(true);
-        }
       }
     } catch (e) {
       setDebugInfo('history error: ' + e);
@@ -298,6 +432,55 @@ export function Chat({ status, onBack, onOpenSettings: _onOpenSettings }: Props)
   useEffect(() => {
     fetchHistory();
   }, [fetchHistory]);
+
+  // Initialize notifications on mount
+  useEffect(() => {
+    initNotifications().then(granted => {
+      if (granted) {
+        console.log('Notifications enabled');
+      }
+    });
+  }, []);
+
+  // Save messages to localStorage when they change
+  useEffect(() => {
+    if (currentAgentId && messages.length > 0) {
+      const key = `clawbox_chat_${currentAgentId}`;
+      localStorage.setItem(key, JSON.stringify(messages));
+    }
+  }, [messages, currentAgentId]);
+
+  // Load/switch chat history when agent changes
+  useEffect(() => {
+    if (activeAgentId && activeAgentId !== currentAgentId) {
+      // Save current agent's messages before switching
+      if (currentAgentId && messages.length > 0) {
+        const key = `clawbox_chat_${currentAgentId}`;
+        localStorage.setItem(key, JSON.stringify(messages));
+      }
+
+      // Load new agent's messages from localStorage
+      const newKey = `clawbox_chat_${activeAgentId}`;
+      const saved = localStorage.getItem(newKey);
+      if (saved) {
+        try {
+          const parsed = JSON.parse(saved) as Message[];
+          // Restore Date objects from serialized strings
+          const restored = parsed.map(m => ({
+            ...m,
+            timestamp: new Date(m.timestamp)
+          }));
+          setMessages(restored);
+        } catch {
+          setMessages([]);
+        }
+      } else {
+        setMessages([]);
+      }
+      setHistoryLoaded(true);
+      setCurrentAgentId(activeAgentId);
+    }
+  }, [activeAgentId, currentAgentId, messages]);
 
   // Fetch configured channels on mount
   const fetchChannels = useCallback(async () => {
@@ -604,17 +787,24 @@ export function Chat({ status, onBack, onOpenSettings: _onOpenSettings }: Props)
 
     const messageId = generateMessageId();
 
-    // Show user message without the file paths (cleaner display)
-    const displayContent = input.trim() + (currentAttachments.length > 0
-      ? ` [${currentAttachments.length} file${currentAttachments.length > 1 ? 's' : ''} attached]`
-      : '');
+    // Show user message with attachments shown inline
+    const displayContent = input.trim();
+
+    // Convert attachments for storage with message
+    const messageAttachments: MessageAttachment[] = currentAttachments.map(f => ({
+      name: f.name,
+      preview: f.preview,
+      type: f.type,
+    }));
 
     const userMessage: Message = {
       id: messageId,
       role: 'user',
       content: displayContent,
       timestamp: new Date(),
+      attachments: messageAttachments.length > 0 ? messageAttachments : undefined,
     };
+    console.log('Sending message with attachments:', userMessage);
     setMessages(prev => [...prev, userMessage]);
     setInput('');
     setAttachedFiles([]);
@@ -633,13 +823,20 @@ export function Chat({ status, onBack, onOpenSettings: _onOpenSettings }: Props)
     try {
       // Send via CLI command instead of WebSocket
       const response = await invoke('send_chat_message', { message: messageContent }) as string;
+      const trimmedResponse = response.trim();
 
       // Update the pending message with the response
       setMessages(prev => prev.map(m =>
         m.id === assistantId
-          ? { ...m, content: response.trim(), pending: false }
+          ? { ...m, content: trimmedResponse, pending: false }
           : m
       ));
+
+      // Check if the response contains a reminder and schedule it
+      const reminder = parseReminderFromResponse(trimmedResponse);
+      if (reminder) {
+        scheduleReminder(reminder.message, reminder.time);
+      }
     } catch (e) {
       setError('Failed to send message: ' + e);
       // Remove the pending message on error
@@ -662,9 +859,12 @@ export function Chat({ status, onBack, onOpenSettings: _onOpenSettings }: Props)
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   };
 
-  const handleDismissChannelSetup = () => {
-    localStorage.setItem('clawbox_channel_setup_dismissed', 'true');
-    setShowChannelSetup(false);
+  const formatFileSize = (bytes: number): string => {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
   };
 
   // Channel icon component
@@ -756,20 +956,24 @@ export function Chat({ status, onBack, onOpenSettings: _onOpenSettings }: Props)
     }
   };
 
-  // Get agent name from localStorage
-  const getAgentName = (): string => {
+  // Get agent config from localStorage
+  const getAgentConfig = (): { name: string; persona: string } => {
     try {
       const agentConfig = localStorage.getItem('clawbox_agent_config');
       if (agentConfig) {
         const parsed = JSON.parse(agentConfig);
-        return parsed.name || 'ClawBox';
+        return {
+          name: parsed.name || 'ClawBox',
+          persona: parsed.persona || 'assistant'
+        };
       }
     } catch {
       // Invalid JSON in localStorage
     }
-    return 'ClawBox';
+    return { name: 'ClawBox', persona: 'assistant' };
   };
-  const agentName = getAgentName();
+  const { name: agentName, persona: agentPersona } = getAgentConfig();
+  const PixelAvatar = getPixelCharacter(agentPersona);
 
   return (
     <div
@@ -792,77 +996,49 @@ export function Chat({ status, onBack, onOpenSettings: _onOpenSettings }: Props)
           </div>
         </div>
       )}
-      {/* Channel Setup Overlay */}
-      {showChannelSetup && (
-        <div className="channel-setup-overlay">
-          <div className="channel-setup-modal telegram-focused">
-            <div className="channel-setup-header">
-              <div className="telegram-logo-large">
-                <svg viewBox="0 0 24 24" fill="currentColor">
-                  <path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z"/>
-                </svg>
-              </div>
-              <h2>Connect Telegram</h2>
-              <p className="channel-setup-subtitle">
-                The easiest way to chat with {agentName} from anywhere
-              </p>
-            </div>
 
-            <div className="telegram-benefits">
-              <div className="benefit-item">
-                <span className="benefit-icon">📱</span>
-                <div>
-                  <strong>Uses your existing account</strong>
-                  <p>No new apps to install - use Telegram on any device</p>
-                </div>
-              </div>
-              <div className="benefit-item">
-                <span className="benefit-icon">🌍</span>
-                <div>
-                  <strong>Works everywhere</strong>
-                  <p>Phone, tablet, desktop, or web browser</p>
-                </div>
-              </div>
-              <div className="benefit-item">
-                <span className="benefit-icon">🔔</span>
-                <div>
-                  <strong>Push notifications</strong>
-                  <p>Get notified instantly when {agentName} responds</p>
-                </div>
-              </div>
-              <div className="benefit-item">
-                <span className="benefit-icon">✨</span>
-                <div>
-                  <strong>Free & easy setup</strong>
-                  <p>Takes less than 2 minutes to connect</p>
-                </div>
-              </div>
-            </div>
-
-            <div className="channel-setup-actions">
-              <button className="btn-primary" onClick={() => {
-                handleDismissChannelSetup();
-                const telegramChannel = CHANNELS.find(c => c.id === 'telegram');
-                if (telegramChannel) {
-                  setSelectedChannel(telegramChannel);
-                  setChannelInput('');
-                  setChannelError(null);
-                  setChannelSuccess(null);
-                }
-              }}>
-                Connect Telegram
-              </button>
-              <button className="btn-text" onClick={() => { handleDismissChannelSetup(); setShowSettings(true); }}>
-                Use a different channel
-              </button>
-              <button className="btn-text muted" onClick={handleDismissChannelSetup}>
-                Skip for now
-              </button>
-            </div>
+      {/* Download progress toast */}
+      {downloadingFile && (
+        <div className="download-toast downloading">
+          <div className="download-toast-icon">
+            <div className="spinner small" />
+          </div>
+          <div className="download-toast-content">
+            <span className="download-toast-title">Downloading...</span>
+            <span className="download-toast-filename">{downloadingFile}</span>
           </div>
         </div>
       )}
 
+      {/* Download complete toast */}
+      {downloadedFile && (
+        <div className="download-toast success">
+          <div className="download-toast-icon success">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M20 6L9 17l-5-5"/>
+            </svg>
+          </div>
+          <div className="download-toast-content">
+            <span className="download-toast-title">Saved to Downloads</span>
+            <span className="download-toast-filename">{downloadedFile.name}</span>
+          </div>
+          <div className="download-toast-actions">
+            <button type="button" className="download-toast-btn open" onClick={openDownloadedFile} title="Open file">
+              Open
+            </button>
+            <button type="button" className="download-toast-btn finder" onClick={showInFinder} title="Show in Finder">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+              </svg>
+            </button>
+            <button type="button" className="download-toast-btn dismiss" onClick={dismissDownloadToast} title="Dismiss">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M18 6L6 18M6 6l12 12"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+      )}
       {/* Settings Panel */}
       {showSettings && (
         <div className="settings-overlay" onClick={() => setShowSettings(false)}>
@@ -923,13 +1099,6 @@ export function Chat({ status, onBack, onOpenSettings: _onOpenSettings }: Props)
                 </button>
               </div>
 
-              <div className="settings-section">
-                <h3>System</h3>
-                <p className="settings-desc">VM and resource management</p>
-                <button className="btn-secondary btn-small" onClick={onBack}>
-                  Open System Dashboard
-                </button>
-              </div>
             </div>
           </div>
         </div>
@@ -1055,6 +1224,15 @@ export function Chat({ status, onBack, onOpenSettings: _onOpenSettings }: Props)
           </div>
         </div>
         <div className="chat-header-actions">
+          <button
+            className="btn-icon"
+            onClick={() => { setShowFilesPanel(true); fetchWorkspaceFiles(); }}
+            title="Files"
+          >
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+            </svg>
+          </button>
           <button className="btn-icon" onClick={() => setShowSettings(true)} title="Settings">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <circle cx="12" cy="12" r="3"/>
@@ -1063,6 +1241,67 @@ export function Chat({ status, onBack, onOpenSettings: _onOpenSettings }: Props)
           </button>
         </div>
       </header>
+
+      {/* Files Panel */}
+      {showFilesPanel && (
+        <div className="settings-overlay" onClick={() => setShowFilesPanel(false)}>
+          <div className="settings-panel" onClick={(e) => e.stopPropagation()}>
+            <div className="settings-header">
+              <h2>Workspace Files</h2>
+              <button className="btn-icon" onClick={() => setShowFilesPanel(false)}>
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M18 6L6 18M6 6l12 12"/>
+                </svg>
+              </button>
+            </div>
+            <div className="settings-content">
+              <p className="settings-desc" style={{ marginBottom: '16px' }}>
+                Files created by or shared with your assistant
+              </p>
+              {workspaceFiles.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: '32px', color: 'var(--text-tertiary)' }}>
+                  <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ marginBottom: '12px', opacity: 0.5 }}>
+                    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                  </svg>
+                  <p>No files yet</p>
+                  <p style={{ fontSize: '13px', marginTop: '4px' }}>Drop files into the chat or ask your assistant to create files</p>
+                </div>
+              ) : (
+                <div className="files-list">
+                  {workspaceFiles.map((file, index) => (
+                    <div key={index} className="file-item" onClick={() => downloadWorkspaceFile(file)}>
+                      <div className="file-icon">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                          <polyline points="14 2 14 8 20 8"/>
+                        </svg>
+                      </div>
+                      <div className="file-info">
+                        <span className="file-name">{file.name}</span>
+                        <span className="file-size">{formatFileSize(file.size)}</span>
+                      </div>
+                      <div className="file-download">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                          <polyline points="7 10 12 15 17 10"/>
+                          <line x1="12" y1="15" x2="12" y2="3"/>
+                        </svg>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <button
+                className="btn-secondary"
+                style={{ marginTop: '16px', width: '100%' }}
+                onClick={fetchWorkspaceFiles}
+              >
+                Refresh
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {error && (
         <div className="chat-error">
@@ -1081,9 +1320,63 @@ export function Chat({ status, onBack, onOpenSettings: _onOpenSettings }: Props)
 
         {historyLoaded && messages.length === 0 && (
           <div className="chat-empty">
-            <div className="chat-empty-icon">🦞</div>
-            <h2>Hey there!</h2>
-            <p>I'm {agentName}, your AI assistant. Send me a message to get started!</p>
+            <div className="chat-empty-avatar">
+              <PixelAvatar size={96} />
+            </div>
+            <h2>Start chatting with {agentName}</h2>
+            <p className="chat-empty-subtitle">Send a message below to begin your conversation</p>
+
+            <div className="chat-empty-divider">
+              <span>or chat from anywhere</span>
+            </div>
+
+            <div className="chat-empty-channels">
+              <button
+                className="channel-quick-btn telegram"
+                onClick={() => {
+                  const telegramChannel = CHANNELS.find(c => c.id === 'telegram');
+                  if (telegramChannel) {
+                    setSelectedChannel(telegramChannel);
+                    setChannelInput('');
+                    setChannelError(null);
+                    setChannelSuccess(null);
+                  }
+                }}
+              >
+                <svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20">
+                  <path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z"/>
+                </svg>
+                <span>Telegram</span>
+              </button>
+              <button
+                className="channel-quick-btn discord"
+                onClick={() => {
+                  const discordChannel = CHANNELS.find(c => c.id === 'discord');
+                  if (discordChannel) {
+                    setSelectedChannel(discordChannel);
+                    setChannelInput('');
+                    setChannelError(null);
+                    setChannelSuccess(null);
+                  }
+                }}
+              >
+                <svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20">
+                  <path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03z"/>
+                </svg>
+                <span>Discord</span>
+              </button>
+              <button
+                className="channel-quick-btn more"
+                onClick={() => setShowSettings(true)}
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="20" height="20">
+                  <circle cx="12" cy="12" r="1"/>
+                  <circle cx="19" cy="12" r="1"/>
+                  <circle cx="5" cy="12" r="1"/>
+                </svg>
+                <span>More</span>
+              </button>
+            </div>
           </div>
         )}
 
@@ -1098,10 +1391,97 @@ export function Chat({ status, onBack, onOpenSettings: _onOpenSettings }: Props)
               </div>
             ) : (
               <>
-                <div className="chat-message-content">
-                  <ReactMarkdown>{message.content}</ReactMarkdown>
-                  {message.pending && <span className="typing-indicator">...</span>}
-                </div>
+                {/* Show attachments for user messages */}
+                {message.role === 'user' && message.attachments && message.attachments.length > 0 && (
+                  <div className="message-attachments">
+                    {message.attachments.map((attachment, idx) => (
+                      attachment.type === 'image' && attachment.preview ? (
+                        <div key={idx} className="message-attachment-image">
+                          <img src={attachment.preview} alt={attachment.name} />
+                        </div>
+                      ) : (
+                        <div key={idx} className="message-attachment-file">
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                            <polyline points="14 2 14 8 20 8"/>
+                          </svg>
+                          <span>{attachment.name}</span>
+                        </div>
+                      )
+                    ))}
+                  </div>
+                )}
+                {(message.content || message.pending) && (
+                  <div className="chat-message-content">
+                    <ReactMarkdown
+                      components={{
+                        a: ({ href, children }) => (
+                          <a
+                            href={href}
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              if (href) {
+                                window.open(href, '_blank', 'noopener,noreferrer');
+                              }
+                            }}
+                          >
+                            {children}
+                          </a>
+                        ),
+                      }}
+                    >
+                      {message.content}
+                    </ReactMarkdown>
+                    {message.pending && <span className="typing-indicator">...</span>}
+                  </div>
+                )}
+                {/* Show download cards for files mentioned in assistant messages */}
+                {message.role === 'assistant' && !message.pending && extractFilesFromMessage(message.content).length > 0 && (
+                  <div
+                    className="message-file-cards"
+                    onClick={(e) => e.stopPropagation()}
+                    onMouseDown={(e) => e.stopPropagation()}
+                  >
+                    {extractFilesFromMessage(message.content).map((filename, idx) => (
+                      <button
+                        key={idx}
+                        type="button"
+                        className="message-file-card"
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                        }}
+                        onClick={async (e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          console.log('Button clicked for:', filename);
+                          const fullPath = `/home/openclaw/.openclaw/workspace/${filename}`;
+                          try {
+                            await downloadFileByPath(fullPath);
+                          } catch (err) {
+                            console.error('Download error in onClick:', err);
+                          }
+                        }}
+                      >
+                        <div className="message-file-icon">
+                          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                            <polyline points="14 2 14 8 20 8"/>
+                          </svg>
+                        </div>
+                        <span className="message-file-name">{filename}</span>
+                        <div className="message-file-download">
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                            <polyline points="7 10 12 15 17 10"/>
+                            <line x1="12" y1="15" x2="12" y2="3"/>
+                          </svg>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                )}
                 <div className="chat-message-meta">
                   <span className="chat-message-time">{formatTime(message.timestamp)}</span>
                   {message.channel && message.channel !== 'desktop' && (
@@ -1129,32 +1509,69 @@ export function Chat({ status, onBack, onOpenSettings: _onOpenSettings }: Props)
         {attachedFiles.length > 0 && (
           <div className="attached-files-preview">
             {attachedFiles.map((file, index) => (
-              <div key={index} className="attached-file-item">
+              <div key={index} className={`attached-file-item ${file.type === 'image' ? 'image-type' : 'file-type'}`}>
                 {file.type === 'image' && file.preview ? (
-                  <img src={file.preview} alt={file.name} className="attached-file-image" />
+                  <>
+                    <img src={file.preview} alt={file.name} className="attached-file-image" />
+                    <button
+                      className="attached-file-remove"
+                      onClick={() => removeAttachedFile(index)}
+                      type="button"
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+                        <path d="M18 6L6 18M6 6l12 12"/>
+                      </svg>
+                    </button>
+                    <div className="attached-file-info">
+                      <span className="attached-file-name">{file.name}</span>
+                    </div>
+                  </>
                 ) : (
-                  <div className="attached-file-icon">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                      <polyline points="14 2 14 8 20 8"/>
-                    </svg>
-                  </div>
+                  <>
+                    <div className="attached-file-icon">
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                        <polyline points="14 2 14 8 20 8"/>
+                      </svg>
+                    </div>
+                    <div className="attached-file-info">
+                      <span className="attached-file-name">{file.name}</span>
+                      <button
+                        className="attached-file-remove"
+                        onClick={() => removeAttachedFile(index)}
+                        type="button"
+                      >
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+                          <path d="M18 6L6 18M6 6l12 12"/>
+                        </svg>
+                      </button>
+                    </div>
+                  </>
                 )}
-                <span className="attached-file-name">{file.name}</span>
-                <button
-                  className="attached-file-remove"
-                  onClick={() => removeAttachedFile(index)}
-                  type="button"
-                >
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <path d="M18 6L6 18M6 6l12 12"/>
-                  </svg>
-                </button>
               </div>
             ))}
           </div>
         )}
         <div className="chat-input-row">
+          {/* Hidden file input */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            onChange={handleFileInputChange}
+            style={{ display: 'none' }}
+            accept="image/*,.pdf,.txt,.json,.csv,.md,.py,.js,.ts,.html,.css"
+          />
+          {/* Attach button */}
+          <button
+            className="chat-attach-btn"
+            onClick={openFilePicker}
+            disabled={isStreaming}
+            title="Attach file"
+            type="button"
+          >
+            📎
+          </button>
           <textarea
             ref={inputRef}
             className="chat-input"

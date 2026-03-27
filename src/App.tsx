@@ -5,10 +5,12 @@ import { SetupWizard } from './pages/SetupWizard';
 import { AgentOnboarding, type AgentConfig } from './pages/AgentOnboarding';
 import { Dashboard } from './pages/Dashboard';
 import { Chat } from './pages/Chat';
+import { AgentSidebar, type Agent } from './components/AgentSidebar';
+import { CreateAgentModal, type CreateAgentConfig } from './components/CreateAgentModal';
 import type { SetupProgressEvent } from './types';
 import './App.css';
 
-type AppView = 'loading' | 'setup' | 'onboarding' | 'dashboard' | 'chat';
+type AppView = 'loading' | 'setup' | 'onboarding' | 'dashboard' | 'chat' | 'cleanup';
 
 function App() {
   const [view, setView] = useState<AppView>('loading');
@@ -19,6 +21,13 @@ function App() {
   const [setupProgress, setSetupProgress] = useState<SetupProgressEvent | null>(null);
   const [vmLoading, setVmLoading] = useState(false);
   const [gatewayToken, setGatewayToken] = useState<string | null>(null);
+  const [isCleaningUp, setIsCleaningUp] = useState(false);
+
+  // Multi-agent state
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [activeAgent, setActiveAgent] = useState<Agent | null>(null);
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -29,11 +38,30 @@ function App() {
     }
   }, []);
 
+  // Load agents
+  const loadAgents = useCallback(async () => {
+    try {
+      const agentsList = await invoke('list_agents') as Agent[];
+      setAgents(agentsList);
+
+      // Get active agent
+      const active = await invoke('get_active_agent') as Agent | null;
+      if (active) {
+        setActiveAgent(active);
+        // Sync to localStorage for Chat component
+        localStorage.setItem('clawbox_agent_config', JSON.stringify({
+          name: active.name,
+          persona: active.persona,
+          avatar: active.avatar,
+        }));
+      }
+    } catch (e) {
+      console.error('Failed to load agents:', e);
+    }
+  }, []);
+
   // Initialize app - only run once on mount
   useEffect(() => {
-    // Clear localStorage for fresh start
-    localStorage.clear();
-
     const init = async () => {
       try {
         const sysInfo = await invoke('get_system_info') as any;
@@ -42,19 +70,26 @@ function App() {
         const vmStatus = await invoke('get_vm_status');
         setStatus(vmStatus);
 
+        // Check for orphaned VM (from previous incomplete install)
+        if (!sysInfo.setup_complete) {
+          const hasOrphan = await invoke('check_orphaned_vm') as boolean;
+          if (hasOrphan) {
+            setView('cleanup');
+            return;
+          }
+        }
+
+        // Load agents
+        await loadAgents();
+
         // Determine initial view - only if still loading
         setView(currentView => {
-          if (currentView !== 'loading') return currentView; // Don't change if already set
+          if (currentView !== 'loading') return currentView;
           if (!sysInfo.setup_complete) {
             return 'setup';
           } else {
-            const onboardingComplete = localStorage.getItem('clawbox_onboarding_complete');
-            if (!onboardingComplete) {
-              return 'onboarding';
-            } else {
-              // Go directly to chat after setup is complete
-              return 'chat';
-            }
+            // Check if we have any agents
+            return 'chat'; // Will show onboarding in chat if no agents
           }
         });
       } catch (e) {
@@ -93,7 +128,7 @@ function App() {
       unlisten.then(fn => fn());
       unlistenChat.then(fn => fn());
     };
-  }, [refreshStatus]);
+  }, [refreshStatus, loadAgents]);
 
   // Fetch gateway token when chat view is opened or VM is running
   useEffect(() => {
@@ -124,7 +159,6 @@ function App() {
         if (currentStatus.vm_status === 'running') {
           setStatus(currentStatus);
           setVmLoading(false);
-          // Fetch gateway token when VM is running
           try {
             const token = await invoke('get_gateway_token') as string | null;
             setGatewayToken(token);
@@ -196,7 +230,18 @@ function App() {
     setError(null);
 
     try {
-      // Configure the agent in OpenClaw
+      // Create the agent in the backend
+      const newAgent = await invoke('create_agent', {
+        config: {
+          name: config.name,
+          persona: config.persona,
+          avatar: config.persona, // Use persona as default avatar
+          preferences: config.preferences,
+          capabilities: config.capabilities,
+        }
+      }) as Agent;
+
+      // Configure OpenClaw with the agent
       const agentConfig = {
         persona: config.persona,
         name: config.name,
@@ -208,8 +253,11 @@ function App() {
 
       await invoke('configure_agent', { config: agentConfig });
 
-      // Save locally
-      localStorage.setItem('clawbox_onboarding_complete', 'true');
+      // Update local state
+      setAgents(prev => [...prev, newAgent]);
+      setActiveAgent(newAgent);
+
+      // Sync to localStorage
       localStorage.setItem('clawbox_agent_config', JSON.stringify(config));
 
       // Go to chat after onboarding
@@ -217,17 +265,71 @@ function App() {
     } catch (e) {
       console.error('Failed to configure agent:', e);
       setError(String(e));
-      // Still move to chat but show error
-      localStorage.setItem('clawbox_onboarding_complete', 'true');
-      localStorage.setItem('clawbox_agent_config', JSON.stringify(config));
       setView('chat');
     }
   };
 
   const handleOnboardingSkip = () => {
-    localStorage.setItem('clawbox_onboarding_complete', 'true');
-    // Go to chat after skipping onboarding
     setView('chat');
+  };
+
+  const handleCleanup = async () => {
+    setIsCleaningUp(true);
+    setError(null);
+    try {
+      await invoke('full_cleanup');
+      setView('setup');
+    } catch (e) {
+      console.error('Cleanup error:', e);
+      setError(String(e));
+    } finally {
+      setIsCleaningUp(false);
+    }
+  };
+
+  const handleSkipCleanup = () => {
+    setView('setup');
+  };
+
+  const handleSelectAgent = async (agent: Agent) => {
+    try {
+      await invoke('switch_agent', { id: agent.id });
+      setActiveAgent(agent);
+      // Sync to localStorage for Chat component
+      localStorage.setItem('clawbox_agent_config', JSON.stringify({
+        name: agent.name,
+        persona: agent.persona,
+        avatar: agent.avatar,
+      }));
+    } catch (e) {
+      console.error('Failed to switch agent:', e);
+      setError(String(e));
+    }
+  };
+
+  const handleCreateAgent = async (config: CreateAgentConfig) => {
+    try {
+      const newAgent = await invoke('create_agent', { config }) as Agent;
+      setAgents(prev => [...prev, newAgent]);
+
+      // Switch to the new agent
+      await handleSelectAgent(newAgent);
+
+      // Configure OpenClaw
+      await invoke('configure_agent', {
+        config: {
+          persona: config.persona,
+          name: config.name,
+          preferences: config.preferences,
+          capabilities: config.capabilities,
+          telegram_bot_token: null,
+          telegram_bot_username: null,
+        }
+      });
+    } catch (e) {
+      console.error('Failed to create agent:', e);
+      throw e;
+    }
   };
 
   if (view === 'loading') {
@@ -236,6 +338,46 @@ function App() {
         <div className="spinner large" />
         <p>Loading ClawBox...</p>
         {error && <p style={{ color: 'red', fontSize: '12px' }}>{error}</p>}
+      </div>
+    );
+  }
+
+  if (view === 'cleanup') {
+    return (
+      <div className="app">
+        <div className="setup-wizard">
+          <div className="setup-content" style={{ textAlign: 'center', padding: '40px' }}>
+            <div style={{ fontSize: '48px', marginBottom: '20px' }}>🔧</div>
+            <h2>Previous Installation Found</h2>
+            <p style={{ color: 'var(--text-secondary)', marginBottom: '30px', maxWidth: '400px', margin: '0 auto 30px' }}>
+              We found data from a previous ClawBox installation. Would you like to clean it up and start fresh, or continue with the existing setup?
+            </p>
+            {error && <p style={{ color: 'var(--error)', marginBottom: '20px' }}>{error}</p>}
+            <div style={{ display: 'flex', gap: '12px', justifyContent: 'center' }}>
+              <button
+                className="setup-button secondary"
+                onClick={handleSkipCleanup}
+                disabled={isCleaningUp}
+              >
+                Keep Existing
+              </button>
+              <button
+                className="setup-button"
+                onClick={handleCleanup}
+                disabled={isCleaningUp}
+              >
+                {isCleaningUp ? (
+                  <>
+                    <span className="spinner" style={{ width: '16px', height: '16px', marginRight: '8px' }} />
+                    Cleaning up...
+                  </>
+                ) : (
+                  'Start Fresh'
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
     );
   }
@@ -277,21 +419,55 @@ function App() {
     );
   }
 
+  // Chat view with sidebar (only show sidebar if we have agents)
   if (view === 'chat') {
-    return (
-      <div className="app">
-        {error && <div className="error-banner">{error}</div>}
-        {status ? (
-          <Chat
-            status={status}
-            onBack={() => setView('dashboard')}
-            onOpenSettings={() => setView('dashboard')}
+    // If no agents exist, show onboarding first
+    if (agents.length === 0) {
+      return (
+        <div className="app">
+          {error && <div className="error-banner">{error}</div>}
+          <AgentOnboarding
+            onComplete={handleOnboardingComplete}
+            onSkip={handleOnboardingSkip}
           />
-        ) : (
-          <div className="app loading-screen">
-            <div className="spinner large" />
-            <p>Connecting...</p>
-          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div className="app app-with-sidebar">
+        {error && <div className="error-banner">{error}</div>}
+
+        <AgentSidebar
+          agents={agents}
+          activeAgentId={activeAgent?.id || null}
+          onSelectAgent={handleSelectAgent}
+          onCreateAgent={() => setShowCreateModal(true)}
+          collapsed={sidebarCollapsed}
+          onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
+        />
+
+        <div className="app-main">
+          {status ? (
+            <Chat
+              status={status}
+              onBack={() => setView('dashboard')}
+              onOpenSettings={() => setView('dashboard')}
+              activeAgentId={activeAgent?.id || null}
+            />
+          ) : (
+            <div className="app loading-screen">
+              <div className="spinner large" />
+              <p>Connecting...</p>
+            </div>
+          )}
+        </div>
+
+        {showCreateModal && (
+          <CreateAgentModal
+            onClose={() => setShowCreateModal(false)}
+            onCreate={handleCreateAgent}
+          />
         )}
       </div>
     );

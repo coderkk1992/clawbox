@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { SystemInfo, SetupConfig, SetupProgressEvent } from '../types';
-import { AnthropicLogo, OpenAILogo, LocalLogo, ClawBoxLogo } from '../components/Icons';
+import { AnthropicLogo, OpenAILogo, ClawBoxLogo } from '../components/Icons';
 
 interface Props {
   systemInfo: SystemInfo;
@@ -10,7 +10,7 @@ interface Props {
 }
 
 type Step = 'welcome' | 'resources' | 'provider' | 'apikey' | 'installing' | 'complete';
-type Provider = 'anthropic' | 'openai' | 'local';
+type Provider = 'anthropic' | 'openai';
 
 const TOTAL_STEPS = 4;
 
@@ -295,17 +295,6 @@ export function SetupWizard({ systemInfo, onComplete, isSettingUp, setupProgress
                 </div>
               </button>
 
-              <button
-                className={`provider-card ${provider === 'local' ? 'selected' : ''}`}
-                onClick={() => { setProvider('local'); handleInstall(); }}
-              >
-                <div className="provider-icon"><LocalLogo size={28} /></div>
-                <div className="provider-info">
-                  <div className="provider-name">Local with Ollama</div>
-                  <div className="provider-desc">100% private, runs on your machine</div>
-                </div>
-                <div className="provider-badge free">Free</div>
-              </button>
             </div>
 
             <div className="wizard-nav">

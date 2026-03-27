@@ -1,3 +1,4 @@
+mod agents;
 mod commands;
 mod setup;
 mod vm;
@@ -15,6 +16,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState::default())
         .setup(|app| {
             // Create tray menu
@@ -25,9 +27,14 @@ pub fn run() {
 
             let menu = Menu::with_items(app, &[&open_item, &chat_item, &separator, &quit_item])?;
 
-            // Build tray icon
+            // Build tray icon with template image for macOS menu bar
+            let tray_icon_bytes = include_bytes!("../icons/tray-icon.png");
+            let tray_icon = tauri::image::Image::from_bytes(tray_icon_bytes)
+                .expect("Failed to load tray icon");
+
             let _tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(tray_icon)
+                .icon_as_template(true)
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -88,6 +95,18 @@ pub fn run() {
             commands::add_channel,
             commands::get_channels,
             commands::upload_file,
+            commands::list_workspace_files,
+            commands::download_file,
+            commands::download_and_save_file,
+            commands::full_cleanup,
+            commands::check_orphaned_vm,
+            commands::create_agent,
+            commands::list_agents,
+            commands::get_agent,
+            commands::get_active_agent,
+            commands::update_agent,
+            commands::delete_agent_by_id,
+            commands::switch_agent,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ClawBox");
