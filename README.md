@@ -77,12 +77,12 @@ Your AI assistant gets the tools it needs. Your system stays protected.
 
 ### Download
 
-Grab the latest release for your Mac:
+Grab the latest release for your Mac from the [**Releases Page**](https://github.com/AiClawBox/ClawBox/releases):
 
-| Chip | Download |
-|------|----------|
-| Apple Silicon (M1/M2/M3/M4) | [ClawBox_0.1.0_aarch64.dmg](releases/ClawBox_0.1.0_aarch64.dmg?raw=true) |
-| Intel | [ClawBox_0.1.0_x64.dmg](releases/ClawBox_0.1.0_x64.dmg?raw=true) |
+| Chip | File |
+|------|------|
+| Apple Silicon (M1/M2/M3/M4) | `ClawBox_x.x.x_aarch64.dmg` |
+| Intel | `ClawBox_x.x.x_x64.dmg` |
 
 ### Requirements
 
