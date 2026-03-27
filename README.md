@@ -13,9 +13,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/AiClawBox/ClawBox/releases"><img src="https://img.shields.io/github/v/release/AiClawBox/ClawBox?style=flat-square&color=blue" alt="Release"></a>
-  <a href="https://github.com/AiClawBox/ClawBox/blob/main/LICENSE"><img src="https://img.shields.io/github/license/AiClawBox/ClawBox?style=flat-square" alt="License"></a>
-  <a href="https://github.com/AiClawBox/ClawBox/stargazers"><img src="https://img.shields.io/github/stars/AiClawBox/ClawBox?style=flat-square" alt="Stars"></a>
+  <a href="https://github.com/coderkk1992/clawbox/releases"><img src="https://img.shields.io/github/v/release/coderkk1992/clawbox?style=flat-square&color=blue" alt="Release"></a>
+  <a href="https://github.com/coderkk1992/clawbox/blob/main/LICENSE"><img src="https://img.shields.io/github/license/coderkk1992/clawbox?style=flat-square" alt="License"></a>
+  <a href="https://github.com/coderkk1992/clawbox/stargazers"><img src="https://img.shields.io/github/stars/coderkk1992/clawbox?style=flat-square" alt="Stars"></a>
 </p>
 
 <p align="center">
@@ -77,12 +77,12 @@ Your AI assistant gets the tools it needs. Your system stays protected.
 
 ### Download
 
-Grab the latest release for your Mac from the [**Releases Page**](https://github.com/AiClawBox/ClawBox/releases):
+Grab the latest release for your Mac from the [**Releases Page**](https://github.com/coderkk1992/clawbox/releases):
 
-| Chip | File |
-|------|------|
-| Apple Silicon (M1/M2/M3/M4) | `ClawBox_x.x.x_aarch64.dmg` |
-| Intel | `ClawBox_x.x.x_x64.dmg` |
+| Chip | Download |
+|------|----------|
+| Apple Silicon (M1/M2/M3/M4) | [ClawBox_0.1.0_aarch64.dmg](https://github.com/coderkk1992/clawbox/releases/download/v1/ClawBox_0.1.0_aarch64.dmg) |
+| Intel | [ClawBox_0.1.0_x64.dmg](https://github.com/coderkk1992/clawbox/releases/download/v1/ClawBox_0.1.0_x64.dmg) |
 
 ### Requirements
 
@@ -96,7 +96,7 @@ That's it. No Homebrew. No Xcode. No developer tools.
 
 ```bash
 # Clone
-git clone https://github.com/AiClawBox/ClawBox.git
+git clone https://github.com/coderkk1992/clawbox.git
 cd ClawBox
 
 # Install dependencies
@@ -150,7 +150,7 @@ We'd love your help! Here's how to get started:
 - Plugin system
 - UI themes
 
-Check out the [issues](https://github.com/AiClawBox/ClawBox/issues) or open a new one.
+Check out the [issues](https://github.com/coderkk1992/clawbox/issues) or open a new one.
 
 ## Tech Stack
 
