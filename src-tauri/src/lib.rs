@@ -107,6 +107,9 @@ pub fn run() {
             commands::update_agent,
             commands::delete_agent_by_id,
             commands::switch_agent,
+            commands::get_ollama_status,
+            commands::pull_ollama_model,
+            commands::start_ollama,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ClawBox");

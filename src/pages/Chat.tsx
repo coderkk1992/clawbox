@@ -413,7 +413,14 @@ export function Chat({ status, onBack: _onBack, onOpenSettings: _onOpenSettings,
             timestamp: new Date(msg.timestamp || Date.now()),
             channel: 'telegram', // These came from Telegram
           };
-        }).filter((m) => m.content.trim());
+        }).filter((m) => {
+          const content = m.content.trim();
+          // Filter out empty messages and heartbeat system messages
+          if (!content) return false;
+          if (content.includes('HEARTBEAT') || content.includes('Read HEARTBEAT.md')) return false;
+          if (content === 'HEARTBEAT_OK') return false;
+          return true;
+        });
 
         setMessages(formattedMessages);
         setDebugInfo(`loaded ${formattedMessages.length} messages`);

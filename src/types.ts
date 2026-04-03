@@ -18,12 +18,16 @@ export interface SystemInfo {
   setup_complete: boolean;
 }
 
+export type Provider = 'anthropic' | 'openai' | 'local';
+
 export interface SetupConfig {
   ram_mb: number;
   cpus: number;
+  provider: Provider;
   anthropic_api_key?: string;
   openai_api_key?: string;
-  model?: string;
+  local_model?: string;
+  ollama_url?: string;
 }
 
 export interface SetupProgressEvent {

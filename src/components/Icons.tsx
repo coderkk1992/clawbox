@@ -167,6 +167,14 @@ export const LocalLogo: React.FC<IconProps> = ({ size = 24, className, color = '
   </svg>
 );
 
+export const OllamaLogo: React.FC<IconProps> = ({ size = 24, className, color = 'currentColor' }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className}>
+    <circle cx="12" cy="12" r="10" stroke={color} strokeWidth="2" fill="none"/>
+    <ellipse cx="12" cy="10" rx="4" ry="4.5" fill={color}/>
+    <path d="M7 17 Q12 21 17 17" stroke={color} strokeWidth="2" strokeLinecap="round" fill="none"/>
+  </svg>
+);
+
 export const NostrLogo: React.FC<IconProps> = ({ size = 24, className, color = 'currentColor' }) => (
   <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className}>
     <circle cx="12" cy="12" r="10" fill={color}/>

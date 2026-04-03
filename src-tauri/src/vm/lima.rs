@@ -77,8 +77,8 @@ provision:
       curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
       apt-get install -y nodejs
 
-      # Install pnpm and OpenClaw
-      npm install -g pnpm openclaw@latest
+      # Install pnpm and OpenClaw (pinned to working version)
+      npm install -g pnpm openclaw@2026.3.31
 
       # Create openclaw user and home directory
       useradd -m -s /bin/bash openclaw || true
@@ -133,11 +133,14 @@ provision:
     }
 
     fn run_limactl(&self, args: &[&str]) -> VmResult<String> {
-        let output = Command::new(self.limactl_bin())
+        let limactl = self.limactl_bin();
+        eprintln!("[lima] Running: {:?} {:?}", limactl, args);
+
+        let output = Command::new(&limactl)
             .args(args)
-            .stderr(std::process::Stdio::null()) // Ignore warnings on stderr
             .output()
             .map_err(|e| {
+                eprintln!("[lima] Command spawn error: {:?}", e);
                 if e.kind() == std::io::ErrorKind::NotFound {
                     VmError::LimaNotInstalled
                 } else {
@@ -145,16 +148,21 @@ provision:
                 }
             })?;
 
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        eprintln!("[lima] Exit status: {:?}", output.status);
+        if !stdout.is_empty() {
+            eprintln!("[lima] Stdout (first 200 chars): {}", stdout.chars().take(200).collect::<String>());
+        }
+        if !stderr.is_empty() {
+            eprintln!("[lima] Stderr: {}", stderr);
+        }
+
         if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+            Ok(stdout)
         } else {
-            // For failed commands, we need to capture stderr
-            let output_with_stderr = Command::new(self.limactl_bin())
-                .args(args)
-                .output()
-                .map_err(|e| VmError::IoError(e))?;
-            let stderr = String::from_utf8_lossy(&output_with_stderr.stderr);
-            Err(VmError::CommandFailed(stderr.to_string()))
+            Err(VmError::CommandFailed(format!("Exit code: {:?}, stderr: {}", output.status.code(), stderr)))
         }
     }
 

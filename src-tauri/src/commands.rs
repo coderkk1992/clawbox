@@ -31,9 +31,11 @@ impl Default for AppState {
 pub struct SetupConfig {
     pub ram_mb: u32,
     pub cpus: u32,
+    pub provider: String, // "anthropic", "openai", or "local"
     pub anthropic_api_key: Option<String>,
     pub openai_api_key: Option<String>,
-    pub model: Option<String>,
+    pub local_model: Option<String>,
+    pub ollama_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -208,7 +210,72 @@ pub async fn run_full_setup(
         }
     }
 
-    emit_progress("openclaw", 70, "Configuring OpenClaw...");
+    // Step 3: Install Ollama on host if using local model
+    if config.provider == "local" {
+        emit_progress("ollama", 62, "Checking Ollama installation...");
+
+        // Check if Ollama is installed on the host
+        let ollama_check = std::process::Command::new("which")
+            .arg("ollama")
+            .output();
+
+        let ollama_installed = ollama_check
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if !ollama_installed {
+            emit_progress("ollama", 65, "Installing Ollama...");
+
+            // Install Ollama using the official install script
+            let install_result = std::process::Command::new("sh")
+                .args(["-c", "curl -fsSL https://ollama.com/install.sh | sh"])
+                .output();
+
+            if let Err(e) = install_result {
+                emit_progress("error", 0, &format!("Failed to install Ollama: {}", e));
+                return Err(format!("Failed to install Ollama: {}", e));
+            }
+
+            emit_progress("ollama", 70, "Ollama installed");
+        } else {
+            emit_progress("ollama", 70, "Ollama already installed");
+        }
+
+        // Pull the model if specified
+        if let Some(model) = &config.local_model {
+            emit_progress("model", 72, &format!("Downloading {}...", model));
+
+            // Start Ollama service if not running
+            let _ = std::process::Command::new("ollama")
+                .arg("serve")
+                .spawn();
+
+            // Give it a moment to start
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+            // Pull the model (this can take a while)
+            let pull_result = std::process::Command::new("ollama")
+                .args(["pull", model])
+                .output();
+
+            match pull_result {
+                Ok(output) => {
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        emit_progress("error", 0, &format!("Failed to pull model: {}", stderr));
+                        return Err(format!("Failed to pull model: {}", stderr));
+                    }
+                    emit_progress("model", 80, &format!("{} downloaded", model));
+                }
+                Err(e) => {
+                    emit_progress("error", 0, &format!("Failed to pull model: {}", e));
+                    return Err(format!("Failed to pull model: {}", e));
+                }
+            }
+        }
+    }
+
+    emit_progress("openclaw", 82, "Configuring OpenClaw...");
 
     // Update systemd service to ensure it loads the .env file (for existing VMs)
     {
@@ -241,8 +308,8 @@ WantedBy=multi-user.target
         let _ = vm.exec("sudo systemctl daemon-reload");
     }
 
-    // Step 4: Configure API keys - always set them fresh (overwrite, not append)
-    emit_progress("config", 85, "Configuring API keys...");
+    // Step 4: Configure API keys or local model - always set them fresh (overwrite, not append)
+    emit_progress("config", 88, "Configuring provider...");
 
     {
         let vm = state.vm_manager.lock().await;
@@ -253,15 +320,34 @@ WantedBy=multi-user.target
             e.to_string()
         })?;
 
-        // Build the .env content
+        // Build the .env content based on provider
         let mut env_content = String::new();
 
-        if let Some(key) = &config.anthropic_api_key {
-            env_content.push_str(&format!("ANTHROPIC_API_KEY={}\n", key));
-        }
+        match config.provider.as_str() {
+            "anthropic" => {
+                if let Some(key) = &config.anthropic_api_key {
+                    env_content.push_str(&format!("ANTHROPIC_API_KEY={}\n", key));
+                }
+            }
+            "openai" => {
+                if let Some(key) = &config.openai_api_key {
+                    env_content.push_str(&format!("OPENAI_API_KEY={}\n", key));
+                }
+            }
+            "local" => {
+                // For local models, configure Ollama connection
+                // Ollama runs on host, VM connects via host.lima.internal
+                let ollama_host = config.ollama_url.clone()
+                    .unwrap_or_else(|| "http://host.lima.internal:11434".to_string());
+                env_content.push_str(&format!("OLLAMA_HOST={}\n", ollama_host));
+                // Ollama requires an API key to be registered as a provider (any value works)
+                env_content.push_str("OLLAMA_API_KEY=ollama-local\n");
 
-        if let Some(key) = &config.openai_api_key {
-            env_content.push_str(&format!("OPENAI_API_KEY={}\n", key));
+                if let Some(model) = &config.local_model {
+                    env_content.push_str(&format!("OPENCLAW_MODEL=ollama/{}\n", model));
+                }
+            }
+            _ => {}
         }
 
         // Write the .env file (overwrite, not append)
@@ -271,7 +357,7 @@ WantedBy=multi-user.target
                 env_content
             );
             vm.exec(&cmd).map_err(|e| {
-                emit_progress("error", 0, &format!("Failed to write API keys: {}", e));
+                emit_progress("error", 0, &format!("Failed to write config: {}", e));
                 e.to_string()
             })?;
         }
@@ -282,24 +368,76 @@ WantedBy=multi-user.target
             e.to_string()
         })?;
 
-        // Set the model if specified (for free/local models)
-        if let Some(model) = &config.model {
-            let cmd = format!(
-                "sudo -u openclaw OPENCLAW_STATE_DIR=/home/openclaw/.openclaw openclaw models set '{}' --non-interactive 2>&1 || true",
-                model
-            );
-            let _ = vm.exec(&cmd);
+        // Configure OpenClaw for local models with proper provider config
+        if config.provider == "local" {
+            if let Some(model) = &config.local_model {
+                let ollama_host = config.ollama_url.clone()
+                    .unwrap_or_else(|| "http://host.lima.internal:11434".to_string());
+
+                // Write openclaw.json with proper ollama provider configuration
+                // Set longer timeout for local models (first request loads model into memory)
+                let config_json = format!(r#"{{
+  "agents": {{
+    "defaults": {{
+      "model": {{
+        "primary": "ollama/{}"
+      }},
+      "models": {{
+        "ollama/{}": {{}}
+      }},
+      "timeoutSeconds": 300
+    }}
+  }},
+  "models": {{
+    "providers": {{
+      "ollama": {{
+        "baseUrl": "{}",
+        "apiKey": "ollama-local",
+        "api": "ollama",
+        "models": [{{"id": "{}", "name": "{}"}}]
+      }}
+    }}
+  }},
+  "commands": {{
+    "native": "auto",
+    "nativeSkills": "auto",
+    "restart": true,
+    "ownerDisplay": "raw"
+  }},
+  "gateway": {{
+    "mode": "local",
+    "bind": "lan"
+  }}
+}}"#, model, model, ollama_host, model, model);
+
+                // Use echo with base64 to avoid heredoc issues
+                use base64::Engine;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(config_json.as_bytes());
+                let cmd = format!(
+                    "echo '{}' | base64 -d | sudo -u openclaw tee /home/openclaw/.openclaw/openclaw.json > /dev/null",
+                    encoded
+                );
+                vm.exec(&cmd).map_err(|e| {
+                    emit_progress("error", 0, &format!("Failed to write openclaw config: {}", e));
+                    e.to_string()
+                })?;
+            }
         }
     }
 
     emit_progress("gateway", 90, "Starting OpenClaw gateway...");
 
-    // Step 5: Restart OpenClaw service to pick up new API keys
+    // Step 5: Stop service, configure for local models, then start
     {
         let vm = state.vm_manager.lock().await;
 
         // Stop the service first (ignore errors if not running)
         let _ = vm.exec("sudo systemctl stop openclaw");
+
+        // For local models, clean up any agent-specific configs that might override our settings
+        if config.provider == "local" {
+            let _ = vm.exec("sudo rm -rf /home/openclaw/.openclaw/agents/main");
+        }
 
         // Make sure the service file has the right environment
         let _ = vm.exec("sudo systemctl daemon-reload");
@@ -322,6 +460,91 @@ WantedBy=multi-user.target
             if !output.trim().contains("active") {
                 emit_progress("error", 0, "OpenClaw service failed to start");
                 return Err("OpenClaw service failed to start".to_string());
+            }
+        }
+    }
+
+    // For local models, stop service, write config, then restart (gateway overwrites config on start)
+    if config.provider == "local" {
+        if let Some(model) = &config.local_model {
+            let vm = state.vm_manager.lock().await;
+            let ollama_host = config.ollama_url.clone()
+                .unwrap_or_else(|| "http://host.lima.internal:11434".to_string());
+
+            // Stop service to prevent config overwrites
+            let _ = vm.exec("sudo systemctl stop openclaw");
+
+            // Get existing gateway token
+            let token_result = vm.exec("sudo cat /home/openclaw/.openclaw/openclaw.json | grep -o '\"token\": *\"[^\"]*\"' | head -1 | sed 's/.*\"\\([^\"]*\\)\"/\\1/'");
+            let token = token_result.unwrap_or_else(|_| "default-token".to_string()).trim().to_string();
+
+            let config_json = format!(r#"{{
+  "agents": {{
+    "defaults": {{
+      "model": {{
+        "primary": "ollama/{}"
+      }},
+      "models": {{
+        "ollama/{}": {{}}
+      }},
+      "timeoutSeconds": 300
+    }}
+  }},
+  "models": {{
+    "providers": {{
+      "ollama": {{
+        "baseUrl": "{}",
+        "apiKey": "ollama-local",
+        "api": "ollama",
+        "models": [{{"id": "{}", "name": "{}"}}]
+      }}
+    }}
+  }},
+  "commands": {{
+    "native": "auto",
+    "nativeSkills": "auto",
+    "restart": true,
+    "ownerDisplay": "raw"
+  }},
+  "gateway": {{
+    "mode": "local",
+    "bind": "lan",
+    "auth": {{
+      "mode": "token",
+      "token": "{}"
+    }}
+  }}
+}}"#, model, model, ollama_host, model, model, token);
+
+            // Use echo with base64 to avoid heredoc issues
+            use base64::Engine;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(config_json.as_bytes());
+            let cmd = format!(
+                "echo '{}' | base64 -d | sudo -u openclaw tee /home/openclaw/.openclaw/openclaw.json > /dev/null",
+                encoded
+            );
+            let _ = vm.exec(&cmd);
+
+            // Restart the service with the new config
+            let _ = vm.exec("sudo systemctl start openclaw");
+        }
+    }
+
+    // Pre-warm local model by sending a simple prompt
+    // This loads the model into memory so first chat is instant
+    if config.provider == "local" {
+        emit_progress("warming", 95, "Loading AI model into memory...");
+
+        {
+            let vm = state.vm_manager.lock().await;
+            // Send a simple prompt to load the model - use curl to Ollama directly for faster warmup
+            if let Some(model) = &config.local_model {
+                let warmup_cmd = format!(
+                    r#"curl -s http://host.lima.internal:11434/api/generate -d '{{"model": "{}", "prompt": "hi", "stream": false}}' > /dev/null 2>&1"#,
+                    model
+                );
+                // This may take a while on first load, but that's the point
+                let _ = vm.exec(&warmup_cmd);
             }
         }
     }
@@ -723,7 +946,32 @@ pub async fn send_chat_message(
     message: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    eprintln!("[send_chat_message] Called with message: {}", message);
+
+    // Check VM status and start if needed
+    {
+        let vm = state.vm_manager.lock().await;
+        eprintln!("[send_chat_message] Got VM lock for status check");
+
+        if let Ok(status) = vm.status() {
+            eprintln!("[send_chat_message] VM status: {:?}", status);
+            if status != crate::vm::VmStatus::Running {
+                eprintln!("[send_chat_message] VM not running, starting...");
+                if let Err(e) = vm.start() {
+                    eprintln!("[send_chat_message] Failed to start VM: {}", e);
+                    return Err(format!("Failed to start VM: {}", e));
+                }
+                eprintln!("[send_chat_message] VM started, waiting...");
+                // Wait for VM to be ready
+                drop(vm); // Release lock while waiting
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            }
+        }
+    } // Lock released here
+
+    eprintln!("[send_chat_message] Getting VM lock for command execution...");
     let vm = state.vm_manager.lock().await;
+    eprintln!("[send_chat_message] Executing command...");
 
     // Escape the message for shell - escape single quotes and backslashes
     let escaped_message = message
@@ -732,15 +980,23 @@ pub async fn send_chat_message(
         .replace("\"", "\\\"");
 
     // Use openclaw agent command to send a message
-    // Source the .env file to get API keys, then run the agent command
+    // Use full path since sudo -u doesn't inherit PATH
+    // Use --local flag to run embedded agent (bypasses gateway issues)
     let cmd = format!(
-        r#"sudo -u openclaw bash -c 'cd /home/openclaw && set -a && source /home/openclaw/.openclaw/.env 2>/dev/null; set +a && OPENCLAW_STATE_DIR=/home/openclaw/.openclaw openclaw agent --agent main --message "{}" 2>&1'"#,
+        r#"sudo -u openclaw bash -c 'OPENCLAW_STATE_DIR=/home/openclaw/.openclaw /usr/bin/openclaw agent --agent main --local --message "{}" 2>&1'"#,
         escaped_message
     );
+    eprintln!("[send_chat_message] Command: {}", cmd);
 
     match vm.exec(&cmd) {
-        Ok(output) => Ok(output),
-        Err(e) => Err(e.to_string()),
+        Ok(output) => {
+            eprintln!("[send_chat_message] Success, output length: {}", output.len());
+            Ok(output)
+        },
+        Err(e) => {
+            eprintln!("[send_chat_message] Error: {}", e);
+            Err(e.to_string())
+        },
     }
 }
 
@@ -1276,4 +1532,125 @@ pub async fn switch_agent(id: String, state: State<'_, AppState>) -> Result<Agen
     let _ = vm.exec("sudo systemctl restart openclaw");
 
     Ok(agent)
+}
+
+// ============ Ollama Commands ============
+
+#[derive(Debug, Serialize)]
+pub struct OllamaStatus {
+    pub installed: bool,
+    pub running: bool,
+    pub models: Vec<OllamaModel>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OllamaModel {
+    pub name: String,
+    pub size: String,
+    pub modified: String,
+}
+
+/// Check Ollama installation and running status on the host
+#[tauri::command]
+pub async fn get_ollama_status() -> Result<OllamaStatus, String> {
+    // Check if Ollama is installed
+    let installed = std::process::Command::new("which")
+        .arg("ollama")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !installed {
+        return Ok(OllamaStatus {
+            installed: false,
+            running: false,
+            models: vec![],
+        });
+    }
+
+    // Check if Ollama is running by trying to list models
+    let list_result = std::process::Command::new("ollama")
+        .arg("list")
+        .output();
+
+    let (running, models) = match list_result {
+        Ok(output) => {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let models: Vec<OllamaModel> = stdout
+                    .lines()
+                    .skip(1) // Skip header line
+                    .filter_map(|line| {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 3 {
+                            Some(OllamaModel {
+                                name: parts[0].to_string(),
+                                size: parts[1].to_string(),
+                                modified: parts[2..].join(" "),
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                (true, models)
+            } else {
+                (false, vec![])
+            }
+        }
+        Err(_) => (false, vec![]),
+    };
+
+    Ok(OllamaStatus {
+        installed,
+        running,
+        models,
+    })
+}
+
+/// Pull a new Ollama model
+#[tauri::command]
+pub async fn pull_ollama_model(model: String, window: Window) -> Result<(), String> {
+    // Emit progress events
+    let emit = |msg: &str| {
+        let _ = window.emit("ollama-pull-progress", msg);
+    };
+
+    emit(&format!("Starting download of {}...", model));
+
+    // Ensure Ollama is running
+    let _ = std::process::Command::new("ollama")
+        .arg("serve")
+        .spawn();
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+    // Pull the model
+    let output = std::process::Command::new("ollama")
+        .args(["pull", &model])
+        .output()
+        .map_err(|e| format!("Failed to pull model: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Failed to pull model: {}", stderr));
+    }
+
+    emit(&format!("{} downloaded successfully!", model));
+
+    Ok(())
+}
+
+/// Start Ollama service on the host
+#[tauri::command]
+pub async fn start_ollama() -> Result<(), String> {
+    let _ = std::process::Command::new("ollama")
+        .arg("serve")
+        .spawn()
+        .map_err(|e| format!("Failed to start Ollama: {}", e))?;
+
+    // Wait for it to start
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    Ok(())
 }
