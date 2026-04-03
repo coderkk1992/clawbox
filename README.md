@@ -68,6 +68,7 @@ Your AI assistant gets the tools it needs. Your system stays protected.
 
 - **Isolated by default** — OpenClaw runs in a VM, not on your host
 - **Native macOS app** — Built with Tauri, feels right at home
+- **Local AI models** — Run Ollama models 100% on your Mac, no API keys needed
 - **Drag & drop files** — Share images and documents with your AI
 - **Multi-channel** — Connect Telegram, Discord, Slack, and more
 - **Multiple agents** — Different personalities for different tasks
@@ -81,8 +82,8 @@ Grab the latest release for your Mac from the [**Releases Page**](https://github
 
 | Chip | Download |
 |------|----------|
-| Apple Silicon (M1/M2/M3/M4) | [ClawBox_0.1.0_aarch64.dmg](https://github.com/coderkk1992/clawbox/releases/download/v1/ClawBox_0.1.0_aarch64.dmg) |
-| Intel | [ClawBox_0.1.0_x64.dmg](https://github.com/coderkk1992/clawbox/releases/download/v1/ClawBox_0.1.0_x64.dmg) |
+| Apple Silicon (M1/M2/M3/M4) | [ClawBox_0.1.0_aarch64.dmg](https://github.com/coderkk1992/clawbox/releases/download/v0.1.0/ClawBox_0.1.0_aarch64.dmg) |
+| Intel | [ClawBox_0.1.0_x64.dmg](https://github.com/coderkk1992/clawbox/releases/download/v0.1.0/ClawBox_0.1.0_x64.dmg) |
 
 ### Requirements
 
